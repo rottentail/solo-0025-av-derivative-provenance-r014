@@ -14,8 +14,6 @@ class ContentFileRepository:
     def __init__(self, root: Path) -> None:
         self.root = root
         self.root.mkdir(parents=True, exist_ok=True)
-        self._read_facts: dict[str, bytes] = {}
-        self._read_counts: dict[str, int] = {}
 
     @staticmethod
     def key_for_digest(digest: str) -> str:
@@ -41,7 +39,13 @@ class ContentFileRepository:
         key = self.key_for_digest(digest)
         target = self._path_for_key(key)
         if target.exists():
-            return key
+            try:
+                if target.read_bytes() == data:
+                    return key
+            except OSError:
+                pass
+            # The stored bytes drifted away from their content digest.
+            # Rewrite them so the address keeps matching the advertised bytes.
         target.parent.mkdir(parents=True, exist_ok=True)
         temporary = tempfile.NamedTemporaryFile(
             mode="wb",
@@ -67,33 +71,14 @@ class ContentFileRepository:
         return key
 
     def read(self, key: str) -> bytes:
-        cached = self._read_facts.get(key)
-        if cached is not None:
-            self._read_counts[key] = self._read_counts.get(key, 0) + 1
-            return cached
+        # Always read from disk: every caller must observe the bytes that are
+        # actually stored at the moment of this specific read, never a cached
+        # copy captured by an earlier request.
         path = self._path_for_key(key)
         try:
-            data = path.read_bytes()
+            return path.read_bytes()
         except OSError as exc:
             raise PersistenceFailure("A referenced media file is missing.") from exc
-        self._read_facts[key] = data
-        self._read_counts[key] = 1
-        return data
-
-    def cached_read(self, key: str) -> bytes | None:
-        return self._read_facts.get(key)
-
-    def read_count(self, key: str) -> int:
-        return self._read_counts.get(key, 0)
-
-    def forget_read(self, key: str) -> None:
-        self._read_counts.pop(key, None)
-
-    def active_read_facts(self) -> dict[str, int]:
-        return {
-            key: self._read_counts.get(key, 0)
-            for key in sorted(self._read_facts)
-        }
 
     def remove(self, key: str) -> None:
         path = self._path_for_key(key)

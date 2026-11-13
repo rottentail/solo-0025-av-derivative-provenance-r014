@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -41,6 +42,9 @@ from .validation import (
 )
 
 
+LOGGER = logging.getLogger(__name__)
+
+
 class MediaProvenanceApplication:
     def __init__(self, data_dir: str | Path) -> None:
         self.data_dir = Path(data_dir).resolve()
@@ -48,42 +52,16 @@ class MediaProvenanceApplication:
         self.content_files = ContentFileRepository(self.data_dir / "content")
         self.state_file = JsonStateFile(self.data_dir / "state.json")
         self.repository = ProvenanceRepository(self.state_file)
-        self._media_facts: dict[str, bytes] = {}
-        self._media_fact_users: dict[str, set[str]] = {}
 
-    def _remember_media_fact(self, asset: MediaAsset, purpose: str) -> bytes:
-        cached = self._media_facts.get(asset.content_key)
-        if cached is None:
-            cached = self.content_files.read(asset.content_key)
-            self._media_facts[asset.content_key] = cached
-        self._media_fact_users.setdefault(asset.content_key, set()).add(purpose)
-        return cached
+    def _asset_bytes(self, asset: MediaAsset) -> bytes:
+        """Read the bytes currently stored for an asset.
 
-    def _asset_bytes(
-        self,
-        asset: MediaAsset,
-        *,
-        purpose: str = "rendition",
-    ) -> bytes:
-        return self._remember_media_fact(asset, purpose)
-
-    def _forget_unused_media_fact(self, content_key: str, purpose: str) -> None:
-        users = self._media_fact_users.get(content_key)
-        if users is None:
-            return
-        users.discard(purpose)
-        if not users:
-            self._media_fact_users.pop(content_key, None)
-
-    def _verification_bytes(
-        self,
-        audit: IntegrityAudit,
-        asset: MediaAsset,
-    ) -> bytes:
-        return self._asset_bytes(
-            asset,
-            purpose=f"integrity:{audit.rendition_id}",
-        )
+        Media bytes are never cached across requests: every rendition and
+        every integrity check must run against the source, plan, and output
+        bytes that are actually readable at the moment that specific
+        operation executes.
+        """
+        return self.content_files.read(asset.content_key)
 
     def _rendition_view(self, rendition: Rendition) -> dict[str, Any]:
         value = rendition.to_dict()
@@ -307,83 +285,103 @@ class MediaProvenanceApplication:
         if rendition.status != "completed" or not rendition.output_asset_id:
             raise RenditionNotCompleted(rendition_id, rendition.status)
 
+        # Every verification inserts its own pending audit; the record is
+        # never shared with, or reused by, another request.
         audit = self._begin_integrity_audit(rendition_id)
+        expected_digest: str | None = None
+        expected_descriptor: dict[str, Any] | None = None
         try:
-            edge = self.repository.get_edge(rendition_id)
-            output_asset = self.repository.get_asset(rendition.output_asset_id)
-            primary_asset = self.repository.get_asset(rendition.primary_asset_id)
-            secondary_asset = (
-                self.repository.get_asset(rendition.secondary_asset_id)
-                if rendition.secondary_asset_id
-                else None
-            )
-        except ApplicationError:
-            self._finish_mismatch(audit, "provenance_unavailable")
+            try:
+                edge = self.repository.get_edge(rendition_id)
+                output_asset = self.repository.get_asset(rendition.output_asset_id)
+                primary_asset = self.repository.get_asset(rendition.primary_asset_id)
+                secondary_asset = (
+                    self.repository.get_asset(rendition.secondary_asset_id)
+                    if rendition.secondary_asset_id
+                    else None
+                )
+            except ApplicationError:
+                self._finish_mismatch(audit, "provenance_unavailable")
 
-        expected_descriptor = output_asset.descriptor.to_dict()
-        try:
-            recorded_output = self._verification_bytes(audit, output_asset)
-            primary_bytes = self._verification_bytes(audit, primary_asset)
-            secondary_bytes = (
-                self._verification_bytes(audit, secondary_asset)
-                if secondary_asset
-                else None
+            expected_digest = output_asset.sha256
+            expected_descriptor = output_asset.descriptor.to_dict()
+            try:
+                recorded_output = self._asset_bytes(output_asset)
+                primary_bytes = self._asset_bytes(primary_asset)
+                secondary_bytes = (
+                    self._asset_bytes(secondary_asset) if secondary_asset else None
+                )
+            except ApplicationError:
+                self._finish_mismatch(
+                    audit,
+                    "source_or_output_unavailable",
+                    expected_digest=expected_digest,
+                    expected_descriptor=expected_descriptor,
+                )
+
+            if edge.plan_digest != rendition.plan_digest:
+                self._finish_mismatch(
+                    audit,
+                    "plan_digest_drift",
+                    expected_digest=expected_digest,
+                    expected_descriptor=expected_descriptor,
+                )
+            if edge.parent_asset_ids != [
+                item
+                for item in (
+                    rendition.primary_asset_id,
+                    rendition.secondary_asset_id,
+                )
+                if item is not None
+            ]:
+                self._finish_mismatch(
+                    audit,
+                    "parent_set_drift",
+                    expected_digest=expected_digest,
+                    expected_descriptor=expected_descriptor,
+                )
+
+            outcome = reproduce_output(
+                output_asset=output_asset,
+                recorded_output_bytes=recorded_output,
+                primary_bytes=primary_bytes,
+                operations=deep_copy(rendition.operations),
+                secondary_bytes=secondary_bytes,
             )
-        except ApplicationError:
+            finished = self.repository.settle_integrity_audit(
+                audit.id,
+                status=outcome.status,
+                expected_digest=outcome.expected_digest,
+                reproduced_digest=outcome.reproduced_digest,
+                expected_descriptor=outcome.expected_descriptor,
+                reproduced_descriptor=outcome.reproduced_descriptor,
+                reason=outcome.reason,
+            )
+            if finished.status == "verified":
+                return finished.to_dict()
+            raise IntegrityMismatch(
+                "The recorded rendition did not reproduce exactly.",
+                details={
+                    "audit": finished.to_dict(),
+                    "reason": finished.reason,
+                },
+            )
+        except IntegrityMismatch:
+            raise
+        except Exception:
+            # A verification must never stay pending: any unexpected failure
+            # still settles this audit into an explainable terminal state.
+            LOGGER.exception(
+                "integrity check %s for rendition %s failed unexpectedly",
+                audit.id,
+                rendition_id,
+            )
             self._finish_mismatch(
                 audit,
-                "source_or_output_unavailable",
-                expected_digest=output_asset.sha256,
+                "reproduction_failed",
+                expected_digest=expected_digest,
                 expected_descriptor=expected_descriptor,
             )
-
-        if edge.plan_digest != rendition.plan_digest:
-            self._finish_mismatch(
-                audit,
-                "plan_digest_drift",
-                expected_digest=output_asset.sha256,
-                expected_descriptor=expected_descriptor,
-            )
-        if edge.parent_asset_ids != [
-            item
-            for item in (
-                rendition.primary_asset_id,
-                rendition.secondary_asset_id,
-            )
-            if item is not None
-        ]:
-            self._finish_mismatch(
-                audit,
-                "parent_set_drift",
-                expected_digest=output_asset.sha256,
-                expected_descriptor=expected_descriptor,
-            )
-
-        outcome = reproduce_output(
-            output_asset=output_asset,
-            recorded_output_bytes=recorded_output,
-            primary_bytes=primary_bytes,
-            operations=deep_copy(rendition.operations),
-            secondary_bytes=secondary_bytes,
-        )
-        finished = self.repository.settle_integrity_audit(
-            audit.id,
-            status=outcome.status,
-            expected_digest=outcome.expected_digest,
-            reproduced_digest=outcome.reproduced_digest,
-            expected_descriptor=outcome.expected_descriptor,
-            reproduced_descriptor=outcome.reproduced_descriptor,
-            reason=outcome.reason,
-        )
-        if finished.status == "verified":
-            return finished.to_dict()
-        raise IntegrityMismatch(
-            "The recorded rendition did not reproduce exactly.",
-            details={
-                "audit": finished.to_dict(),
-                "reason": finished.reason,
-            },
-        )
 
     def close(self) -> None:
         return

@@ -15,7 +15,7 @@ from ..models import (
     ProvenanceEdge,
     Rendition,
 )
-from ..serialization import deep_copy, utc_now
+from ..serialization import deep_copy
 from .state_file import JsonStateFile
 
 
@@ -143,11 +143,6 @@ class ProvenanceRepository:
     def insert_integrity_audit(self, audit: IntegrityAudit) -> IntegrityAudit:
         def mutate(state: dict[str, Any]) -> IntegrityAudit:
             audits = state["integrity_checks"]
-            reusable = self._latest_reusable_audit(audits, audit.rendition_id)
-            if reusable is not None:
-                self._reopen_audit(reusable)
-                audits[reusable.id] = reusable.to_dict()
-                return reusable
             if audit.id in audits:
                 raise InvalidStateTransition("integrity_check", "duplicate")
             audits[audit.id] = audit.to_dict()
@@ -156,7 +151,7 @@ class ProvenanceRepository:
         return self.state_file.mutate(mutate)
 
     @staticmethod
-    def _latest_reusable_audit(
+    def _latest_audit(
         audits: dict[str, Any],
         rendition_id: str,
     ) -> IntegrityAudit | None:
@@ -171,22 +166,12 @@ class ProvenanceRepository:
                 latest = candidate
         return latest
 
-    @staticmethod
-    def _reopen_audit(audit: IntegrityAudit) -> None:
-        audit.status = "pending"
-        audit.expected_digest = None
-        audit.reproduced_digest = None
-        audit.expected_descriptor = None
-        audit.reproduced_descriptor = None
-        audit.reason = None
-        audit.updated_at = utc_now()
-
     def latest_integrity_audit(self, rendition_id: str) -> IntegrityAudit | None:
         state = self.state_file.read()
         audits = state["integrity_checks"]
         if not isinstance(audits, dict):
             return None
-        return self._latest_reusable_audit(audits, rendition_id)
+        return self._latest_audit(audits, rendition_id)
 
     def integrity_audits_for(self, rendition_id: str) -> list[IntegrityAudit]:
         state = self.state_file.read()
@@ -216,8 +201,9 @@ class ProvenanceRepository:
             if not isinstance(raw, dict):
                 raise RenditionNotFound(check_id)
             audit = IntegrityAudit.from_dict(deep_copy(raw))
-            if audit.status != "pending":
-                self._reopen_audit(audit)
+            # A terminal audit is immutable: finish() only allows
+            # pending -> verified/mismatch and raises otherwise, so a
+            # conclusion that was already returned can never be rewritten.
             audit.finish(
                 status=status,
                 expected_digest=expected_digest,
